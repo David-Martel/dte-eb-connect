@@ -7,9 +7,14 @@
     "start": "node index.js",
     "start:instant": "npm start -- --instant",
     "start:summation": "npm start -- --summation",
+    "start:metering": "npm start -- --metering",
+    "start:ha": "npm start -- --metering --publish-ha-discovery",
     "test": "jest --detectOpenHandles"
   },
   "author": "Timothy Fisher",
+  "engines": {
+    "node": ">=18"
+  },
   "license": "MIT",
   "dependencies": {
     "aws-iot-device-sdk": "^2.2.1",

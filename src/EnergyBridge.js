@@ -1,127 +1,258 @@
-const mqtt = require('mqtt');
-const ConsoleLogger = require('./ConsoleLogger.js').ConsoleLogger;
-const MessageHandler = require('./MessageHandler.js');
-require('dotenv').config();
-const Topics = require('./config-topics.js').topics();
+const mqtt = require("mqtt");
+const ConsoleLogger = require("./ConsoleLogger.js").ConsoleLogger;
+const MessageHandler = require("./MessageHandler.js");
+const { resolveSelection } = require("./config-topics.js");
 
-
-// mosquitto_sub -h 10.0.0.103 -p 2883 -i some_identifier -t '#' -v
-// mosquitto_sub -h 10.0.0.103  -p 2883 -i some_identifier -u admin -P trinity -t 'event/metering/summation/minute' -v
-// don't need user and password
-// mosquitto_sub -h 10.0.0.103  -p 2883 -i some_identifier -t 'event/metering/summation/minute' -v
-
-
-class EnergyBridge {
-
-  // topic = topic name (see config-topics.js)
-  constructor(ip, port, topic) {
-    var that = this;
-    this.ip = ip;
-    this.port = port;
-    this.client = null;
-    this.connected = false;
-    this.topic = topic;
-    this.subscriptionTopics = [];
-    Topics.forEach(function(topic) {
-      if (topic.name == that.topic) { //(topic.enabled == true) {
-        that.subscriptionTopics.push(topic);
-      }
-    });
+function boolFromEnv(value, defaultValue = false) {
+  if (value === undefined || value === null || value === "") {
+    return defaultValue;
   }
 
-  connect(options) {
-    //ConsoleLogger.event("Attempting to connect to EnergyBridge...");
-    ConsoleLogger.event("Attempting to connect to EnergyBridge...");
-    var that = this;
-    this.client = mqtt.connect(`tcp://${this.ip}:${this.port}`, null); //options);
-    this.addListeners();
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+class EnergyBridge {
+  constructor(configOrIp, port, selection = "summation") {
+    const legacyConfig =
+      typeof configOrIp === "string"
+        ? { sourceHost: configOrIp, sourcePort: port, topicSelection: selection }
+        : configOrIp;
+
+    this.config = {
+      discoveryPrefix: legacyConfig.discoveryPrefix || "homeassistant",
+      keepAliveIntervalMs: Number(legacyConfig.keepAliveIntervalMs || 30000),
+      logger: legacyConfig.logger || ConsoleLogger,
+      mqttFactory: legacyConfig.mqttFactory || mqtt.connect,
+      publishDiscovery:
+        legacyConfig.publishDiscovery ??
+        boolFromEnv(process.env.HA_DISCOVERY_ENABLED, false),
+      selection: legacyConfig.topicSelection || selection || "summation",
+      sourceClientId:
+        legacyConfig.sourceClientId ||
+        process.env.EB_CLIENT_ID ||
+        `dte-energy-bridge-${Date.now()}`,
+      sourceHost: legacyConfig.sourceHost || process.env.EB_IP,
+      sourcePassword: legacyConfig.sourcePassword || process.env.EB_PASSWORD,
+      sourcePort: Number(legacyConfig.sourcePort || process.env.EB_PORT || 2883),
+      sourceProtocol:
+        legacyConfig.sourceProtocol || process.env.EB_PROTOCOL || "mqtt",
+      sourceUsername: legacyConfig.sourceUsername || process.env.EB_USERNAME,
+      targetClientId:
+        legacyConfig.targetClientId ||
+        process.env.TARGET_MQTT_CLIENT_ID ||
+        `dte-energy-bridge-target-${Date.now()}`,
+      targetPassword:
+        legacyConfig.targetPassword || process.env.TARGET_MQTT_PASSWORD,
+      targetUrl: legacyConfig.targetUrl || process.env.TARGET_MQTT_URL,
+      targetUsername:
+        legacyConfig.targetUsername || process.env.TARGET_MQTT_USERNAME,
+    };
+
+    this.ip = this.config.sourceHost;
+    this.port = this.config.sourcePort;
+    this.client = null;
+    this.targetClient = null;
+    this.connected = false;
+    this.subscriptionTopics = resolveSelection(this.config.selection);
+    this.keepAliveTimer = null;
+  }
+
+  get sourceUrl() {
+    return `${this.config.sourceProtocol}://${this.config.sourceHost}:${this.config.sourcePort}`;
+  }
+
+  connect() {
+    if (!this.config.sourceHost) {
+      throw new Error("Energy Bridge source host is required");
+    }
+
+    this.config.logger.event(
+      `Connecting to Energy Bridge ${this.config.sourceHost}:${this.config.sourcePort}`
+    );
+
+    this.client = this.config.mqttFactory(this.sourceUrl, {
+      clientId: this.config.sourceClientId,
+      password: this.config.sourcePassword,
+      username: this.config.sourceUsername,
+    });
+    this.addSourceListeners();
+
+    if (this.config.targetUrl) {
+      this.targetClient = this.config.mqttFactory(this.config.targetUrl, {
+        clientId: this.config.targetClientId,
+        password: this.config.targetPassword,
+        username: this.config.targetUsername,
+      });
+      this.addTargetListeners();
+    }
+
+    return this;
   }
 
   disconnect() {
-    var that = this;
-    return new Promise(function(resolve, reject) {
-      ConsoleLogger.event("Disconnecting from EnergyBridge");
-      that.client.end(true, function(){
-        that.connectd = false;
-        resolve();
+    clearInterval(this.keepAliveTimer);
+
+    const closeClient = (client) =>
+      new Promise((resolve) => {
+        if (!client) {
+          resolve();
+          return;
+        }
+
+        client.end(true, () => resolve());
       });
+
+    return Promise.all([closeClient(this.client), closeClient(this.targetClient)]).then(
+      () => {
+        this.connected = false;
+      }
+    );
+  }
+
+  addSourceListeners() {
+    this.client.on("connect", () => {
+      this.config.logger.event("Energy Bridge connected");
+      this.connected = true;
+      this.addSubscriptions();
+      this.refresh();
+
+      if (!this.keepAliveTimer) {
+        this.keepAliveTimer = setInterval(
+          () => this.refresh(),
+          this.config.keepAliveIntervalMs
+        );
+        this.keepAliveTimer.unref?.();
+      }
+    });
+
+    this.client.on("message", (topic, payload, packet) => {
+      const normalized = MessageHandler.handle(
+        { body: payload, topic },
+        this.config.logger
+      );
+
+      if (this.targetClient) {
+        this.targetClient.publish(topic, payload, { retain: false });
+      }
+
+      return normalized;
+    });
+
+    this.client.on("error", (error) => {
+      this.config.logger.fail(error.message);
+    });
+
+    this.client.on("close", () => {
+      this.connected = false;
+      this.config.logger.fail("Energy Bridge connection closed");
+    });
+
+    this.client.on("offline", () => {
+      this.config.logger.event("Energy Bridge offline");
+    });
+
+    this.client.on("reconnect", () => {
+      this.config.logger.event("Reconnecting to Energy Bridge");
+    });
+
+    this.client.on("end", () => {
+      this.config.logger.event("Energy Bridge session ended");
     });
   }
 
-  addSubscriptions(topics) {
-    var that = this;
-    topics.forEach(function(topic) {
-      ConsoleLogger.subscribe("Subscribing to " + topic.name);
-      that.client.subscribe(topic.match);
+  addTargetListeners() {
+    this.targetClient.on("connect", () => {
+      this.config.logger.event(`Connected to target broker ${this.config.targetUrl}`);
+      if (this.config.publishDiscovery) {
+        this.publishHomeAssistantDiscovery();
+      }
+    });
+
+    this.targetClient.on("error", (error) => {
+      this.config.logger.fail(`Target broker error: ${error.message}`);
     });
   }
 
-  addListeners() {
-    var that = this;
-    this.client.on('connect', function(){
-          ConsoleLogger.event("EnergyBridge Connected");
-          that.connected = true;
-          that.addSubscriptions(that.subscriptionTopics)
-    });
-    this.client.on('message', function (topic, payload, packet) {
-      //ConsoleLogger.yellow(JSON.stringify(packet));
-      MessageHandler.handle({topic:topic, body:payload});
-    });
-    this.client.on('error', function(error) {
-      ConsoleLogger.fail(error.message);
-    });
-    this.client.on('close', function(error) {
-      let msg = (error ? `(${error})` : "");
-      ConsoleLogger.fail(`Connection closed ${msg}`);
-      that.connected = false;
-    });
-    this.client.on('reconnect', function(error) {
-      ConsoleLogger.event("Reconnecting to Energy Bridge");
-    });
-    this.client.on('disconnect', function(error) {
-      ConsoleLogger.event("Energy Bridge disconnected");
-    });
-    this.client.on('offline', function(error) {
-      //ConsoleLogger.fail("Energy Bridge offline");
-      ConsoleLogger.event("Energy Bridge offline");
-      //ConsoleLogger.fail("Be sure you are on the same local network that your Energy Bridge is connected to.");
-      ConsoleLogger.event("Be sure you are on the same local network that your Energy Bridge is connected to.");
-      that.disconnect();
-    });
-    this.client.on('end', function() {
-      ConsoleLogger.event("Energy Bridge session ended");
+  addSubscriptions() {
+    this.subscriptionTopics.forEach((topic) => {
+      this.config.logger.subscribe(`Subscribing to ${topic.match}`);
+      this.client.subscribe(topic.match);
     });
   }
 
   refresh() {
-    if (this.client) {
-      let time = Date.now();
-      let payload = JSON.stringify(this.getTimestampRequestIdBody()); //"{'timestamp':" + time.toString() + ", 'request_id':'CH5tlREh-3'}";
-      ConsoleLogger.publish("Publishing to: remote/request/is_app_open");
-      this.client.publish('remote/request/is_app_open', payload, {}, function(err) {
-        if (err) {
-          ConsoleLogger.event("Error while publishing: " + err);
-        }
-      });
+    if (!this.client) {
+      return;
     }
+
+    const payload = JSON.stringify(this.getTimestampRequestIdBody());
+    this.config.logger.publish("Publishing keepalive to remote/request/is_app_open");
+    this.client.publish("remote/request/is_app_open", payload, {}, (error) => {
+      if (error) {
+        this.config.logger.fail(`Error while publishing keepalive: ${error.message}`);
+      }
+    });
   }
 
-  requestSummation() {
+  publishHomeAssistantDiscovery() {
+    if (!this.targetClient) {
+      return;
+    }
 
-  }
+    const discoveryBase = `${this.config.discoveryPrefix}/sensor/dte_energy_bridge`;
+    const commonDevice = {
+      identifiers: ["dte_energy_bridge"],
+      manufacturer: "Powerley",
+      model: "Energy Bridge",
+      name: "DTE Energy Bridge",
+    };
 
-  getTopicByName(name) {
-    return Topics.find(function(topic) {
-      return topic.name == name;
+    const configs = [
+      {
+        objectId: "instantaneous_power",
+        payload: {
+          device: commonDevice,
+          device_class: "power",
+          name: "DTE Energy Usage Instantaneous",
+          object_id: "dte_energy_usage_instantaneous",
+          state_class: "measurement",
+          state_topic: "event/metering/instantaneous_demand",
+          unique_id: "dte_energy_usage_instantaneous",
+          unit_of_measurement: "W",
+          value_template: "{{ value_json.demand | float(0) | round(0) }}",
+        },
+      },
+      {
+        objectId: "minute_total",
+        payload: {
+          device: commonDevice,
+          device_class: "energy",
+          name: "DTE Energy Usage Minute Total",
+          object_id: "dte_energy_usage_minute_total",
+          state_class: "total_increasing",
+          state_topic: "event/metering/summation/minute",
+          unique_id: "dte_energy_usage_minute_total",
+          unit_of_measurement: "kWh",
+          value_template:
+            "{{ (value_json.value | float(0) / 60000) | round(5) }}",
+        },
+      },
+    ];
+
+    configs.forEach(({ objectId, payload }) => {
+      this.targetClient.publish(
+        `${discoveryBase}/${objectId}/config`,
+        JSON.stringify(payload),
+        { retain: true }
+      );
     });
   }
 
   getTimestampRequestIdBody() {
-    let time = Date.now();
-    let body = {};
-    body.timestamp = time.toString();
-    body.request_id = 'DteEnergyBridgeClient-' + this.getRandomInt(0, 100);
-    return body;
+    return {
+      request_id: `DteEnergyBridgeClient-${this.getRandomInt(0, 100000)}`,
+      timestamp: Date.now().toString(),
+    };
   }
 
   getRandomInt(min, max) {

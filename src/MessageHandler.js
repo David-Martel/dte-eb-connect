@@ -1,45 +1,66 @@
 const ConsoleLogger = require("./ConsoleLogger.js").ConsoleLogger;
-const Topics = require("./config-topics.js").topics();
+const { topics } = require("./config-topics.js");
+
+const Topics = topics();
 
 class MessageHandler {
-  static handle(message) {
-    if (!this.searchTopicByName(message.topic)) {
-      ConsoleLogger.fail(`Unhandled Topic - ${message.topic}`);
-      ConsoleLogger.white(message.body);
-    } else {
-      if (message.topic.includes("polling_mode")) {
-        return;
-      } // don't log polling_mode messages
-      ConsoleLogger.timestamp();
-      ConsoleLogger.topic(`TOPIC: ${message.topic}`);
-      let msg = this.parse(message);
-      if (msg) {
-        ConsoleLogger.white(msg);
-      }
+  static handle(message, logger = ConsoleLogger) {
+    const normalized = this.normalize(message);
+
+    if (!normalized.knownTopic) {
+      logger.fail(`Unhandled Topic - ${message.topic}`);
+      logger.white(this.stringifyPayload(normalized.payload));
+      return normalized;
     }
+
+    if (message.topic.includes("polling_mode")) {
+      return normalized;
+    }
+
+    logger.timestamp();
+    logger.topic(`TOPIC: ${message.topic}`);
+    if (normalized.summary) {
+      logger.white(normalized.summary);
+    }
+
+    return normalized;
   }
 
-  static parse(message) {
+  static normalize(message) {
+    const payload = this.parsePayload(message.body);
     let topic = this.getTopicByName(message.topic);
+
+    const normalized = {
+      category: topic ? topic.category : null,
+      knownTopic: Boolean(topic),
+      payload,
+      summary: null,
+      topic: message.topic,
+      topicConfig: topic,
+    };
+
     if (!topic) {
-      return "Unable to parse message for topic: " + message.topic;
+      normalized.summary = "Unable to parse message for topic: " + message.topic;
+      return normalized;
     }
+
     if (
-      topic.category == "usage-instant" ||
-      topic.category == "usage-summation"
+      topic.category === "usage-instant" ||
+      topic.category === "usage-summation"
     ) {
-      let body = JSON.parse(message.body);
       let value = null;
-      if (topic.category == "usage-summation") {
-        value = body.value;
+      if (topic.category === "usage-summation") {
+        value = payload.value;
       }
-      if (topic.category == "usage-instant") {
-        value = body.demand;
+      if (topic.category === "usage-instant") {
+        value = payload.demand;
       }
-      return this.formatUsage(body.time, value);
-    } else {
-      return message.body;
+      normalized.summary = this.formatUsage(payload.time, value);
+      return normalized;
     }
+
+    normalized.summary = this.stringifyPayload(payload);
+    return normalized;
   }
 
   static formatUsage(time, value) {
@@ -55,7 +76,7 @@ class MessageHandler {
 
   static getTopicByName(name) {
     return Topics.find(function (topic) {
-      return topic.match == name;
+      return topic.match === name;
     });
   }
 
@@ -67,6 +88,30 @@ class MessageHandler {
       }
     });
     return result;
+  }
+
+  static parsePayload(payload) {
+    if (Buffer.isBuffer(payload)) {
+      payload = payload.toString();
+    }
+
+    if (typeof payload !== "string") {
+      return payload;
+    }
+
+    try {
+      return JSON.parse(payload);
+    } catch (_error) {
+      return payload;
+    }
+  }
+
+  static stringifyPayload(payload) {
+    if (typeof payload === "string") {
+      return payload;
+    }
+
+    return JSON.stringify(payload);
   }
 }
 

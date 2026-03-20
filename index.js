@@ -1,23 +1,48 @@
-const EnergyBridge = require('./src/EnergyBridge.js');
+require("dotenv").config();
+const EnergyBridge = require("./src/EnergyBridge.js");
 
-let instant = false;
-let summation = true;
+function getSelection(argv) {
+  if (argv.includes("--all")) {
+    return "all";
+  }
 
-if (process.argv[2] && process.argv[2] === '--instant') {
-  instant = true;
-  summation = true;
+  if (argv.includes("--instant")) {
+    return "instant";
+  }
+
+  if (argv.includes("--metering")) {
+    return "metering";
+  }
+
+  return "summation";
 }
-else if (process.argv[2] && process.argv[2] === '--summation') {
-  summation = true;
+
+function hasFlag(argv, flag) {
+  return argv.includes(flag);
 }
 
-console.log(`EB_IP = ${process.env.EB_IP}`);
-let eb = new EnergyBridge(process.env.EB_IP, process.env.EB_PORT, instant, summation);
-eb.connect({username:process.env.EB_USERNAME,
-            password:process.env.EB_PASSWORD,
-            clientId:process.env.EB_CLIENT_ID});
+async function main() {
+  const argv = process.argv.slice(2);
+  const bridge = new EnergyBridge({
+    publishDiscovery:
+      process.env.HA_DISCOVERY_ENABLED === "true" ||
+      hasFlag(argv, "--publish-ha-discovery"),
+    sourceClientId: process.env.EB_CLIENT_ID,
+    sourceHost: process.env.EB_IP,
+    sourcePassword: process.env.EB_PASSWORD,
+    sourcePort: process.env.EB_PORT,
+    sourceUsername: process.env.EB_USERNAME,
+    targetClientId: process.env.TARGET_MQTT_CLIENT_ID,
+    targetPassword: process.env.TARGET_MQTT_PASSWORD,
+    targetUrl: process.env.TARGET_MQTT_URL,
+    targetUsername: process.env.TARGET_MQTT_USERNAME,
+    topicSelection: getSelection(argv),
+  });
 
-eb.refresh();
+  bridge.connect();
+}
 
-// keep data connection alive
-setInterval(function() {eb.refresh();}, 30000);
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
